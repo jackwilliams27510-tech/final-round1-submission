@@ -20,8 +20,8 @@ logging.basicConfig(
 )
 
 # Constants
-POSITION_LIMIT = 40
-MAX_TICKS = 1500
+POSITION_LIMIT = 50
+MAX_TICKS = 1000
 
 
 def import_trader(file_path: str) -> type:
@@ -182,9 +182,7 @@ def main(round_data_path: str, trading_algo: str) -> None:
     end = datetime.now()
     quantity_data = pd.DataFrame(metrics).set_index("tick")
 
-    print(f"Time per tick: {(end-start)/MAX_TICKS}")
-
-    # Portfolio summary
+   
     print("\n=== Final Portfolio State ===")
     print(f"PnL: {portfolio.pnl:.2f}")
 
@@ -202,7 +200,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Run the trading simulation.")
     parser.add_argument(
         "--round",
-        default="C:/DUFS-trading-simulator-ready/Round_2.csv",
+        default="C:/DUFS-trading-simulator-ready/Round_3.csv",
         help="Main data file path",
     )
     parser.add_argument(
@@ -211,6 +209,5 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     main(args.round, args.algo)
-
-
-
+    
+    

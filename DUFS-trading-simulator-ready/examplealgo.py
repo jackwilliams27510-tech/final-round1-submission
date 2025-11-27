@@ -2,127 +2,102 @@ from datamodel import *
 
 class Trader:
     def __init__(self):
-        self.products = ["bond1","bond2","bond3","bond4","ETF1"]
+        self.products = ["Call", "Put", "Underlying"]
 
-        # tight & aggressive threshold
-        self.threshold_etf1 = 1.25
+        # Parity constants (from regression)
+        self.parity_const = 10000
+        self.parity_threshold = 3.9   # small tweak from original 4.0
 
-        # base size (dynamic scaling overrides this)
-        self.trade_size = 2
+        # Improved-quote MM sizes (kept identical to original)
+        self.mm_size = 2
+        self.mm_size_big = 4
 
+        # Delta model (unchanged)
+        self.delta_call = 0.46
+        self.delta_put = -0.54
 
-    # -------------------------------
-    # MID / BID / ASK HELPER
-    # -------------------------------
-    def _mid_bid_ask(self, state, product):
-        listings = Listing(state.orderbook[product], product)
-        best_bid = next(iter(listings.buy_orders.keys()))
-        best_ask = next(iter(listings.sell_orders.keys()))
+        # Hedging (unchanged)
+        self.hedge_threshold = 5
+        self.hedge_unit = 2
+
+        # Inventory safety levels (kept identical)
+        self.soft_limit = 35
+        self.hard_limit = 48
+
+        # For volatility calc
+        self.last_under = None
+
+    # ======================================================
+    # Best bid/ask (correct extraction)
+    # ======================================================
+    def _best_prices(self, state, product):
+        listing = Listing(state.orderbook[product], product)
+        best_bid = max(listing.buy_orders.keys())
+        best_ask = min(listing.sell_orders.keys())
         mid = (best_bid + best_ask) / 2
         return mid, best_bid, best_ask
 
-
-    # -------------------------------
-    # MAIN STRATEGY
-    # -------------------------------
+    # ======================================================
+    # Main strategy loop
+    # ======================================================
     def run(self, state):
-
         orders = []
-        mids = {}
-        best_bid = {}
-        best_ask = {}
+        pos = state.positions
 
-        # -------- Gather price data --------
+        mids, bids, asks = {}, {}, {}
         for p in self.products:
-            mid, bid, ask = self._mid_bid_ask(state, p)
-            mids[p] = mid
-            best_bid[p] = bid
-            best_ask[p] = ask
+            m, bb, ba = self._best_prices(state, p)
+            mids[p] = m
+            bids[p] = bb
+            asks[p] = ba
 
-        # -------- Theoretical ETF1 value --------
-        fair_etf1 = mids["bond1"] + mids["bond2"] + mids["bond3"]
-        diff1 = mids["ETF1"] - fair_etf1
+        # ======================================================
+        # Parity Arbitrage Only (original structure preserved)
+        # ======================================================
+        parity_error = mids["Call"] - mids["Put"] - mids["Underlying"] + self.parity_const
+        arb_size = 1 if any(abs(pos[p]) > self.soft_limit for p in self.products) else 2
 
-        # -------- Spread costs --------
-        spread_etf = best_ask["ETF1"] - best_bid["ETF1"]
-        spread_b1 = best_ask["bond1"] - best_bid["bond1"]
-        spread_b2 = best_ask["bond2"] - best_bid["bond2"]
-        spread_b3 = best_ask["bond3"] - best_bid["bond3"]
-        avg_bond_spread = (spread_b1 + spread_b2 + spread_b3) / 3
-        # -------- Effective mispricing --------
-        effective_diff = diff1 - (spread_etf * 0.7)
+        if parity_error > self.parity_threshold:
+            if (
+                pos["Call"] - arb_size >= -self.hard_limit and
+                pos["Put"]  + arb_size <= self.hard_limit and
+                pos["Underlying"] + arb_size <= self.hard_limit
+            ):
+                orders.append(Order("Call", bids["Call"], -arb_size))
+                orders.append(Order("Put",  asks["Put"], +arb_size))
+                orders.append(Order("Underlying", asks["Underlying"], +arb_size))
 
-        # -------- Volatility confirmation boost --------
-        # If bonds move tightly together → price shock → arb tends to be reliable
-        vol_boost = 1.0
-        if abs(mids["bond1"] - mids["bond2"]) < 1.2 and abs(mids["bond2"] - mids["bond3"]) < 1.2:
-            vol_boost = 1.28   # strong improvement without adding noise
+        elif parity_error < -self.parity_threshold:
+            if (
+                pos["Call"] + arb_size <= self.hard_limit and
+                pos["Put"]  - arb_size >= -self.hard_limit and
+                pos["Underlying"] - arb_size >= -self.hard_limit
+            ):
+                orders.append(Order("Call", asks["Call"], +arb_size))
+                orders.append(Order("Put",  bids["Put"], -arb_size))
+                orders.append(Order("Underlying", bids["Underlying"], -arb_size))
 
-        # -------- Trade quality score --------
-        trade_quality = (effective_diff / max(spread_etf + 0.5, 1)) * vol_boost
-        entry_margin = 0.05
-        positions = state.positions
-        limits = state.pos_limit
+        # ======================================================
+        # Delta Hedging (unchanged original)
+        # ======================================================
+        call_inv = pos["Call"]
+        put_inv = pos["Put"]
+        under_inv = pos["Underlying"]
 
-        def can_trade(prod, delta):
-            return abs(positions[prod] + delta) <= limits[prod]
+        option_delta = call_inv * self.delta_call + put_inv * self.delta_put
+        net_delta = option_delta - under_inv
 
+        if net_delta > self.hedge_threshold:
+            hedge_size = min(self.hedge_unit, self.hard_limit - under_inv)
+            orders.append(Order("Underlying", bids["Underlying"], -hedge_size))
 
-        # ================================================
-        #   PACKAGE-C: AGGRESSIVE ETf1 DYNAMIC SIZING
-        # ================================================
-        raw_size = abs(trade_quality) ** 1.07 * 3.7   # stronger punch than your 5233 version
-        size = max(1, min(int(raw_size), 11))
-
-        # reduce size near ETF1 limits
-        if abs(positions["ETF1"]) > 32:
-            size = max(1, size // 2)
-
-        # reduce size near bond limits
-        if any(abs(positions[b]) > 28 for b in ["bond1","bond2","bond3"]):
-            size = max(1, size // 2)
-
-
-        # ================================================
-        #   ETF1 OVERPRICED → SELL ETF1 & BUY BONDS
-        # ================================================
-   
-        if trade_quality > self.threshold_etf1 + entry_margin:
-            if can_trade("ETF1", -size) and all(can_trade(b, +size) for b in ["bond1","bond2","bond3"]):
-                orders.append(Order("ETF1", best_bid["ETF1"], -size))
-                for b in ["bond1","bond2","bond3"]:
-                    orders.append(Order(b, best_ask[b], +size))
-
-
-        # ================================================
-        #   ETF1 UNDERPRICED → BUY ETF1 & SELL BONDS
-        # ================================================
-        if trade_quality < -self.threshold_etf1 - entry_margin:
-            if can_trade("ETF1", +size) and all(can_trade(b, -size) for b in ["bond1","bond2","bond3"]):
-                orders.append(Order("ETF1", best_ask["ETF1"], +size))
-                for b in ["bond1","bond2","bond3"]:
-                    orders.append(Order(b, best_bid[b], -size))
-
-
-
-        # ================================================
-        #   INVENTORY MANAGEMENT (SAFE & PROFITABLE)
-        # ================================================
-        for b in ["bond1","bond2","bond3"]:
-
-            bond_spread = best_ask[b] - best_bid[b]
-
-            # Only unwind when:
-            # - position is large AND
-            # - bond spreads are cheap AND
-            # - trade_quality low (signal weaker)
-            if positions[b] > 28 and bond_spread <= 3 and abs(trade_quality) < 0.8:
-                if can_trade(b, -3):
-                    orders.append(Order(b, best_bid[b], -3))
-
-            if positions[b] < -30 and bond_spread <= 3 and abs(trade_quality) < 0.8:
-                if can_trade(b, +2):
-                    orders.append(Order(b, best_ask[b], +2))
+        elif net_delta < -self.hedge_threshold:
+            hedge_size = min(self.hedge_unit, self.hard_limit + under_inv)
+            orders.append(Order("Underlying", asks["Underlying"], +hedge_size))
 
         return orders
+
+
+
+
 
